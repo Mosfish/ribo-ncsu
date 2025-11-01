@@ -168,42 +168,23 @@ class HybridGVP_GAT_Long_Layer(nn.Module):
         x_local = tuple_sum(x_res_gvp, self.dropout_gvp(dh_local))
         s_local, v_local = x_local # s_local 形状: [nodes, confs, dim]
 
-        # 准备标量特征，用于两个并行的注意力路径
+
         s_res_attn = s_local # 保存 GVP 输出用于最终残差连接
         s_norm_attn = self.norm_attn(s_local) # 形状: [nodes, confs, dim]
         s_reshaped = s_norm_attn.permute(1, 0, 2) # 形状: [confs, nodes, dim]
         
-        # --- 【!!! 删除 V3 门控计算 !!!】 ---
-        # gate = torch.sigmoid(self.gate_linear(s_norm_attn)) # <--- 删除
-        # gate_permuted = gate.permute(1, 0, 2) # <--- 删除
-        
-        # --- 2. & 3. 并行的短程(GAT)与长程路径 ---
+
         s_short_out = self.short_range_attn(s_reshaped, edge_index) # 形状: [confs, nodes, dim]
         s_long_out = self.long_range_attn(s_reshaped)     # 形状: [confs, nodes, dim]
         
-        # --- 【!!! 核心修改：实现手动门控融合 !!!】 ---
+        s_local_permuted = s_local.permute(1, 0, 2) 
 
-        # --- 【!!! 移除旧的 V3 融合 !!!】 ---
-        # s_fused_out = (gate_permuted * s_short_out) + ((1 - gate_permuted) * s_long_out) # <--- 删除
-        # s_fused_out = s_fused_out.permute(1, 0, 2) # <--- 删除这行 permute，因为下面会做
-
-        # 1. 准备 GVP 输出 s_local (需要 permute)
-        s_local_permuted = s_local.permute(1, 0, 2) # 形状: [confs, nodes, dim]
-
-        # 2. 定义 alpha 值
-        alpha = 0.3 # 例如，GVP 输出占 50%，注意力输出占 50%
+        alpha = 0.3 
         
         # 3. 计算注意力组合输出 (简单相加)
         s_attn_combined = s_short_out + s_long_out # 形状: [confs, nodes, dim]
-
-        # 4. 执行手动融合
-        s_fused_out = (alpha * s_local_permuted) + ((1 - alpha) * s_attn_combined) # 形状: [confs, nodes, dim]
-        
-        # 5. 还原维度
+        s_fused_out = (alpha * s_local_permuted) + ((1 - alpha) * s_attn_combined) # 形状: [confs, nodes, dim]   
         s_fused_out = s_fused_out.permute(1, 0, 2) # 形状: [nodes, confs, dim]
-        # --- 【修改结束】 ---
-
-        # 应用第二个残差连接 (加回 s_res_attn，即原始 GVP 输出 s_local)
         s_after_attn = s_res_attn + self.dropout_attn(s_fused_out)
 
         # --- 4. FFN路径 ---
@@ -212,7 +193,6 @@ class HybridGVP_GAT_Long_Layer(nn.Module):
         s_ffn_out = self.ffn(s_norm_ffn)
         s_final = s_res_ffn + self.dropout_ffn(s_ffn_out)
         
-        # 矢量特征直接“旁路”，保持等变性
         v_final = v_local
         
         return (s_final, v_final)
