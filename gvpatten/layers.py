@@ -11,7 +11,8 @@ import torch.nn.functional as F
 import torch_geometric
 from torch_geometric.nn import MessagePassing
 from torch_scatter import scatter_add
-
+from typing import Optional
+from torch_geometric.utils import softmax
 #########################################################################
 
 class GVPConvLayer(nn.Module):
@@ -120,15 +121,9 @@ class GVPConvLayer(nn.Module):
             dh = self.ff_func(self.norm[1](x))
             x = tuple_sum(x, self.dropout[1](dh))
         else:
-            if self.residual:
-                x = self.norm[0](tuple_sum(x, self.dropout[0](dh)))
-            else:
-                x = self.norm[0](dh)
-            dh_ffn = self.ff_func(x)
-            if self.residual:
-                x = self.norm[1](tuple_sum(x, self.dropout[1](dh_ffn)))
-            else:
-                x = self.norm[1](dh_ffn)
+            x = self.norm[0](tuple_sum(x, self.dropout[0](dh))) if self.residual else dh
+            dh = self.ff_func(x)
+            x = self.norm[1](tuple_sum(x, self.dropout[1](dh))) if self.residual else dh
         
         if node_mask is not None:
             x_[0][node_mask], x_[1][node_mask] = x[0], x[1]
@@ -200,199 +195,259 @@ class GVPConv(MessagePassing):
         message = tuple_cat((s_j, v_j), edge_attr, (s_i, v_i))
         message = self.message_func(message)
         return _merge(*message)
-    
 #########################################################################
-class GVPAttentionLayer(nn.Module):
+class GVPAttentionConvLayer(nn.Module):
+    '''
+    Full GVP Attention Layer (V6 Architecture)
+    
+    Applies 'GVPAttentionConv' message passing, followed by
+    residual updates and a pointwise feedforward network.
+    This is the V6 replacement for 'MultiGVPConvLayer'.
+    
+    :param node_dims: node embedding dimensions (n_scalar, n_vector)
+    :param edge_dims: input edge embedding dimensions (n_scalar, n_vector)
+    :param heads: number of attention heads
+    :param n_feedforward: number of GVPs to use in feedforward function
+    :param drop_rate: drop probability in all dropout layers
+    :param activations: tuple of functions (scalar_act, vector_act) to use in GVPs
+    :param vector_gate: whether to use vector gating.
+    :param residual: whether to use residual connections
+    :param norm_first: whether to apply layer norm before 'conv' and 'ff'
+    '''
     def __init__(
             self, 
             node_dims, 
-            edge_h_dims,
-            edge_in_dims,
-            num_heads=4,
-            max_spd=32,     # Graphormer RPE 的最大距离
-            n_message=3,    # (用于 local_geom_conv)
-            n_feedforward=2,# (用于 FFN 隐藏层维度)
+            edge_dims,
+            heads=4, 
+            n_feedforward=2, 
             drop_rate=.1,
-            max_path_len=10,
             activations=(F.silu, torch.sigmoid), 
-            vector_gate=True, 
-            norm_first=True                     
+            vector_gate=True,
+            residual=True,
+            norm_first=False,
         ):
+        super(GVPAttentionConvLayer, self).__init__()
         
-        super(GVPAttentionLayer, self).__init__()
-        
-        self.s_dim, self.v_dim = node_dims
-        self.edge_s_in_dim, _ = edge_in_dims
-        self.norm_first = norm_first
-        self.num_heads = num_heads
-        self.max_spd = max_spd
-        self.local_geom_conv = GVPAttention( 
-            node_dims, node_dims, edge_h_dims, n_message,
-            aggr="mean", activations=activations, vector_gate=vector_gate
+        # Use our new V6 'conv' core
+        self.conv = GVPAttentionConv(
+            node_dims, node_dims, edge_dims,
+            heads=heads, 
+            activations=activations, 
+            vector_gate=vector_gate
         )
-        
-        self.global_scalar_attn = nn.MultiheadAttention(
-            embed_dim=self.s_dim,
-            num_heads=num_heads,
-            dropout=drop_rate,
-            batch_first=True # (Confs, Nodes, Dim)
-        )
-        self.dropout_mha = Dropout(drop_rate) # (GVP-aware Dropout)
-        
-        self.spatial_bias = nn.Embedding(max_spd + 2, num_heads) # +2 for 0 and -1
-        self.edge_encoder = EdgeEncoder(
-            num_heads=num_heads, 
-            edge_dim=self.edge_s_in_dim,
-            max_path_len=max_path_len
-        )
-        self.fusion_gate_linear = nn.Linear(self.s_dim * 2, self.s_dim)
-       
-        self.norm_ffn = LayerNorm(node_dims) # (GVP-aware Norm)
-        ffn_hid_dim = node_dims[0] * n_feedforward 
-        self.ffn = PositionwiseFeedForward(
-            d_in=self.s_dim, 
-            d_hid=ffn_hid_dim, 
-            dropout=drop_rate
-        )
-        self.dropout_ffn = Dropout(drop_rate) # (GVP-aware Dropout)
-        self.norm1 = LayerNorm(node_dims) # (GVP-aware Norm)
-
-
-    def forward(self, x, edge_index, edge_attr, shortest_path_edges, edge_features_s_all,
-                spd_matrix, batch_mask=None):
-        '''
-        :param x: tuple (s, V) of `torch.Tensor`
-                  s: [Nodes, Confs, s_dim]
-                  v: [Nodes, Confs, v_dim, 3]
-        :param edge_index: array of shape [2, n_edges]
-        :param edge_attr: tuple (edge_s, edge_v) of `torch.Tensor`
-        :param spd_matrix: [Nodes, Nodes] 
-        :param batch_mask: [Confs * Heads, Nodes, Nodes] (可选的, 0.0 或 -inf)
-        '''
-        x_res1 = x
-        
-        # --- Pre-Normalization ---
-        x_norm = self.norm1(x) if self.norm_first else x
-        s_norm, v_norm = x_norm
-
-        # --- Local Path ---
-        dh_local = self.local_geom_conv(x_norm, edge_index, edge_attr)
-        s_local, v_local_update = dh_local 
-        # s_local: [N, C, s_dim], v_local_update: [N, C, v_dim, 3]
-
-        # --- Global Path ---
-        s_in_global = s_norm.permute(1, 0, 2) # [Confs, Nodes, s_dim]
-        n_confs, n_nodes, _ = s_in_global.shape
-
-        spd_matrix_clamped = torch.clamp(spd_matrix + 1, min=0, max=self.max_spd + 1)
-        spd_bias = self.spatial_bias(spd_matrix_clamped) # [N, N, H]
-        spd_bias = spd_bias.permute(2, 0, 1)
-        edge_bias = self.edge_encoder(edge_features_s_all, shortest_path_edges) # [H, N, N]
-        total_bias = spd_bias + edge_bias        # [H, N, N]
-        total_bias = total_bias.unsqueeze(0).repeat(n_confs, 1, 1, 1)
-        total_bias = total_bias.view(n_confs * self.num_heads, n_nodes, n_nodes)
-
-        if batch_mask is not None:
-            total_bias = total_bias + batch_mask
-        s_global_update, _ = self.global_scalar_attn(
-            s_in_global, s_in_global, s_in_global,
-            attn_mask=total_bias, 
-            need_weights=False
-        )
-        # s_global_update: [C, N, s_dim] -> [N, C, s_dim]
-        s_global_update = s_global_update.permute(1, 0, 2)
-
-        gate_input = torch.cat([s_local, s_global_update], dim=-1)
-        g = torch.sigmoid(self.fusion_gate_linear(gate_input))
-        
-        s_fused = g * s_local + (1 - g) * s_global_update
-
-        x_update = (s_fused, v_local_update) 
-        x_out = tuple_sum(x_res1, self.dropout_mha(x_update)) 
-        
-        if not self.norm_first: 
-            x_out = self.norm1(x_out)
-
-        x_res2 = x_out
-        x_norm_ffn = self.norm_ffn(x_out) if self.norm_first else x_out
-        s_ffn_in, v_ffn_in = x_norm_ffn
-
-        s_ffn_out = self.ffn(s_ffn_in)
-
-        s_update_ffn = self.dropout_ffn.sdropout(s_ffn_out) 
-        v_update_ffn = torch.zeros_like(v_ffn_in) 
-        x_update_ffn = (s_update_ffn, v_update_ffn)
-        x_final = tuple_sum(x_res2, x_update_ffn)
-
-        # --- FFN Post-Normalization ---
-        if not self.norm_first:
-            x_final = self.norm_ffn(x_final)
-        
-        return x_final
-
-
-
-class GVPAttention(MessagePassing):
-    '''
-    GVPConv for handling multiple conformations
-    '''
-    def __init__(self, in_dims, out_dims, edge_dims,
-                 n_layers=3, module_list=None, aggr="mean", 
-                 activations=(F.silu, torch.sigmoid), vector_gate=True):
-        super(GVPAttention, self).__init__(aggr=aggr)
-        self.si, self.vi = in_dims
-        self.so, self.vo = out_dims
-        self.se, self.ve = edge_dims
         
         GVP_ = functools.partial(GVP, 
                 activations=activations, vector_gate=vector_gate)
-        
-        module_list = module_list or []
-        if not module_list:
-            if n_layers == 1:
-                module_list.append(
-                    GVP_((2*self.si + self.se, 2*self.vi + self.ve), 
-                        (self.so, self.vo)))
-            else:
-                module_list.append(
-                    GVP_((2*self.si + self.se, 2*self.vi + self.ve), out_dims)
-                )
-                for i in range(n_layers - 2):
-                    module_list.append(GVP_(out_dims, out_dims))
-                module_list.append(GVP_(out_dims, out_dims,
-                                       activations=(None, None)))
-        self.message_func = nn.Sequential(*module_list)
+        self.norm = nn.ModuleList([LayerNorm(node_dims) for _ in range(2)])
+        self.dropout = nn.ModuleList([Dropout(drop_rate) for _ in range(2)])
+
+        # Standard GVP FeedForward network (identical to MultiGVPConvLayer)
+        ff_func = []
+        if n_feedforward == 1:
+            ff_func.append(GVP_(node_dims, node_dims))
+        else:
+            hid_dims = 4*node_dims[0], 2*node_dims[1]
+            ff_func.append(GVP_(node_dims, hid_dims))
+            for i in range(n_feedforward-2):
+                ff_func.append(GVP_(hid_dims, hid_dims))
+            ff_func.append(GVP_(hid_dims, node_dims, activations=(None, None)))
+        self.ff_func = nn.Sequential(*ff_func)
+        self.residual = residual
+        self.norm_first = norm_first
 
     def forward(self, x, edge_index, edge_attr):
         '''
         :param x: tuple (s, V) of `torch.Tensor`
         :param edge_index: array of shape [2, n_edges]
         :param edge_attr: tuple (s, V) of `torch.Tensor`
+        
+        (This forward pass is identical to MultiGVPConvLayer, just
+         swapping out the self.conv module.)
+        '''
+        if self.norm_first:
+            dh = self.conv(self.norm[0](x), edge_index, edge_attr)
+            x = tuple_sum(x, self.dropout[0](dh))
+            dh = self.ff_func(self.norm[1](x))
+            x = tuple_sum(x, self.dropout[1](dh))
+        else:
+            dh = self.conv(x, edge_index, edge_attr)
+            x = self.norm[0](tuple_sum(x, self.dropout[0](dh))) if self.residual else dh
+            dh = self.ff_func(x)
+            x = self.norm[1](tuple_sum(x, self.dropout[1](dh))) if self.residual else dh
+        return x
+#########################################################################
+class GVPAttentionConv(MessagePassing):
+    '''
+    GVP-Native Attention-based Message Passing (V6 Architecture)
+    
+    Combines GVP's SE(3)-equivariance with MHA, GAT, and TransformerConv
+    (edge bias) concepts in a unified layer.
+    
+    - Q, K, V projections are GVP-native.
+    - Attention energy is computed by a GVP-based 'head' (GAT-style).
+    - Edge features (GVP tuples) are used to bias K and V (Transformer-style).
+    '''
+    def __init__(self, in_dims, out_dims, edge_dims,
+                 heads=4,
+                 activations=(F.silu, torch.sigmoid), 
+                 vector_gate=True):
+        
+        super(GVPAttentionConv, self).__init__(aggr="add", node_dim=0)
+        
+        self.si, self.vi = in_dims
+        self.so, self.vo = out_dims
+        self.se, self.ve = edge_dims
+        
+        self.heads = heads
+        assert self.so % heads == 0 and self.vo % heads == 0, \
+               "Output dimensions must be divisible by number of heads"
+        
+        self.head_s_dim = self.so // heads
+        self.head_v_dim = self.vo // heads
+        self.head_dims = (self.head_s_dim, self.head_v_dim)
+
+        GVP_ = functools.partial(GVP, 
+                activations=activations, vector_gate=vector_gate)
+
+        # 1. Q, K, V Projections (GVP-Native)
+        self.to_q = GVP_(in_dims, (self.so, self.vo))
+        self.to_k = GVP_(in_dims, (self.so, self.vo))
+        self.to_v = GVP_(in_dims, (self.so, self.vo))
+
+        # 2. Edge Bias Projections (TransformerConv idea)
+        self.edge_proj_k = GVP_(edge_dims, (self.so, self.vo))
+        self.edge_proj_v = GVP_(edge_dims, (self.so, self.vo))
+
+        # 3. Attention Head (GAT idea)
+        # Input: concatenated Q_i and K_j_biased (per-head)
+        attn_in_dims = (2 * self.head_s_dim, 2 * self.head_v_dim)
+        # Output: 1 scalar (energy) per head
+        self.attn_gvp = GVP(attn_in_dims, (1, 0), 
+                            activations=(None, None))
+
+        # 4. Final Output Projection (Multi-head fusion)
+        self.out_proj = GVP_((self.so, self.vo), (self.so, self.vo))
+        
+
+    def forward(self, x, edge_index, edge_attr):
+        '''
+        :param x: tuple (s, V) of `torch.Tensor` 
+                  s: [n_nodes, n_conf, si], V: [n_nodes, n_conf, vi, 3]
+        :param edge_index: array of shape [2, n_edges]
+        :param edge_attr: tuple (s, V) of `torch.Tensor`
+                  s: [n_edges, n_conf, se], V: [n_edges, n_conf, ve, 3]
         '''
         x_s, x_v = x
-        n_conf = x_s.shape[1]
-        
-        # x_s: [n_nodes, n_conf, d] -> [n_nodes, n_conf * d]
-        x_s = x_s.contiguous().view(x_s.shape[0], x_s.shape[1] * x_s.shape[2])        
-        # x_v: [n_nodes, n_conf, d, 3] -> [n_nodes, n_conf * d * 3]
-        x_v = x_v.contiguous().view(x_v.shape[0], x_v.shape[1] * x_v.shape[2] * 3)
-        
-        message = self.propagate(edge_index, s=x_s, v=x_v, edge_attr=edge_attr)
-        
-        return _split_multi(message, self.so, self.vo, n_conf)
+        n_nodes, n_conf = x_s.shape[:2]
 
-    def message(self, s_i, v_i, s_j, v_j, edge_attr):
-        # [n_nodes, n_conf * d] -> [n_nodes, n_conf, d]
-        s_i = s_i.view(s_i.shape[0], s_i.shape[1]//self.si, self.si)
-        s_j = s_j.view(s_j.shape[0], s_j.shape[1]//self.si, self.si)
-        # [n_nodes, n_conf * d * 3] -> [n_nodes, n_conf, d, 3]
-        v_i = v_i.view(v_i.shape[0], v_i.shape[1]//(self.vi * 3), self.vi, 3)
-        v_j = v_j.view(v_j.shape[0], v_j.shape[1]//(self.vi * 3), self.vi, 3)
+        # 1. Project Q, K, V
+        q = self.to_q(x)
+        k = self.to_k(x)
+        v = self.to_v(x)
 
-        message = tuple_cat((s_j, v_j), edge_attr, (s_i, v_i))
-        message = self.message_func(message)
-        return _merge_multi(*message)
+        # 2. Project Edge Biases
+        e_k = self.edge_proj_k(edge_attr)
+        e_v = self.edge_proj_v(edge_attr)
+        
+        # --- Flatten all tuples for MessagePassing ---
+        # We follow the GVPConv pattern of flattening vectors for propagation
+        # (s, v) -> (s, v_flat) -> cat(s, v_flat)
+        
+        def flatten_heads(t, n, n_conf):
+            s, v = t
+            # --- [V6.4] BUG 修复 ---
+            # .view() requires contiguous tensor, but GVP output (v) is transposed.
+            # .reshape() is robust and handles both contiguous and non-contiguous cases.
+            s_flat = s.reshape(n, n_conf * self.so)
+            v_flat = v.reshape(n, n_conf * self.vo * 3)
+            # --- [V6.4] 修复结束 ---
+            return torch.cat([s_flat, v_flat], dim=-1)
 
+        q_flat = flatten_heads(q, n_nodes, n_conf)
+        k_flat = flatten_heads(k, n_nodes, n_conf)
+        v_flat = flatten_heads(v, n_nodes, n_conf)
+        
+        n_edges = edge_attr[0].shape[0]
+        e_k_flat = flatten_heads(e_k, n_edges, n_conf)
+        e_v_flat = flatten_heads(e_v, n_edges, n_conf)
+
+        # 3. Propagate messages
+        message_flat = self.propagate(
+            edge_index, 
+            q=q_flat, k=k_flat, v=v_flat,
+            e_k=e_k_flat, e_v=e_v_flat,
+            n_conf=n_conf
+        )
+
+        # 4. Un-flatten aggregated message
+        s_dim_flat = n_conf * self.so
+        s_out = message_flat[..., :s_dim_flat].view(n_nodes, n_conf, self.so)
+        v_out = message_flat[..., s_dim_flat:].view(n_nodes, n_conf, self.vo, 3)
+        out = (s_out, v_out)
+
+        # 5. Final output projection (fusion)
+        final_out = self.out_proj(out)
+        return final_out
+
+    def message(self, q_i, k_j, v_j, e_k, e_v, n_conf: int,
+                index: torch.Tensor, ptr: Optional[torch.Tensor], 
+                size_i: Optional[int]) -> torch.Tensor:
+
+        # --- Un-flatten all inputs ---
+        
+        # Helper to un-flatten and reshape to heads
+        def unflatten_heads(t_flat, n_conf):
+            s_dim_flat = n_conf * self.so
+            s = t_flat[..., :s_dim_flat].view(-1, n_conf, self.heads, self.head_s_dim)
+            v = t_flat[..., s_dim_flat:].view(-1, n_conf, self.heads, self.head_v_dim, 3)
+            return s, v
+
+        q_i = unflatten_heads(q_i, n_conf)
+        k_j = unflatten_heads(k_j, n_conf)
+        v_j = unflatten_heads(v_j, n_conf)
+        e_k = unflatten_heads(e_k, n_conf)
+        e_v = unflatten_heads(e_v, n_conf)
+
+        # 1. Apply Edge Bias (in GVP space)
+        k_j_biased = tuple_sum(k_j, e_k)
+        v_j_biased = tuple_sum(v_j, e_v)
+
+        # 2. Compute Attention Energy (GAT-style)
+        # attn_input: (s_cat, v_cat)
+        attn_input = tuple_cat(q_i, k_j_biased)
+        
+        # self.attn_gvp maps (2*head_dims) -> (heads, 0)
+        # energy_s shape: [E, n_conf, H, 1]
+        energy_s = self.attn_gvp(attn_input)
+        energy_scalar = energy_s.squeeze(-1) # [E, n_conf, H]
+
+        # 3. Softmax
+        # We need to softmax over neighbors j for each node i.
+        # Reshape for softmax: [E, n_conf * H]
+        energy_flat = energy_scalar.view(-1, n_conf * self.heads)
+        alpha_flat = softmax(energy_flat, index, ptr=ptr, dim=0)
+        # Reshape back: [E, n_conf, H]
+        alpha = alpha_flat.view(-1, n_conf, self.heads)
+
+        # 4. Apply Attention to Biased Value
+        # alpha_s: [E, n_conf, H, 1]
+        alpha_s = alpha.unsqueeze(-1)
+        # alpha_v: [E, n_conf, H, 1, 1]
+        alpha_v = alpha.unsqueeze(-1).unsqueeze(-1)
+
+        v_s_biased, v_v_biased = v_j_biased
+        msg_s = alpha_s * v_s_biased # [E, n_conf, H, s_h]
+        msg_v = alpha_v * v_v_biased # [E, n_conf, H, v_h, 3]
+
+        # --- Flatten message for output ---
+        # msg_s: [E, n_conf * H * s_h] = [E, n_conf * so]
+        msg_s_flat = msg_s.contiguous().view(msg_s.shape[0], -1)
+        # msg_v: [E, n_conf * H * v_h * 3] = [E, n_conf * vo * 3]
+        msg_v_flat = msg_v.contiguous().view(msg_v.shape[0], -1)
+
+        return torch.cat([msg_s_flat, msg_v_flat], dim=-1)
+
+########################################################################
 #########################################################################
 
 class GVP(nn.Module):
@@ -462,46 +517,6 @@ class GVP(nn.Module):
         return (s, v) if self.vo else s
     
 #########################################################################
-class EdgeEncoder(nn.Module):
-    '''
-    计算 Graphormer 边编码 (EE) 偏置 c_ij。
-    '''
-    def __init__(self, num_heads, edge_dim, max_path_len):
-        super().__init__()
-        self.num_heads = num_heads
-        self.edge_dim = edge_dim
-        self.max_path_len = max_path_len
-        self.edge_weights = nn.Embedding(max_path_len + 1, num_heads * edge_dim)
-
-    def forward(self, edge_features_s, shortest_path_edges):
-        N = shortest_path_edges.shape[0]
-        device = edge_features_s.device
-
-        valid_edge_indices = shortest_path_edges.clamp(min=0)
-        # path_edge_features: [N, N, max_path_len, edge_s_dim]
-        path_edge_features = edge_features_s[valid_edge_indices]
-
-        path_positions = torch.arange(1, self.max_path_len + 1, device=device).unsqueeze(0).unsqueeze(0).expand(N, N, -1)
-        # path_weights: [N, N, max_path_len, num_heads * edge_dim]
-        path_weights = self.edge_weights(path_positions)
-        # path_weights reshaped: [N, N, max_path_len, num_heads, edge_dim]
-        path_weights = path_weights.view(N, N, self.max_path_len, self.num_heads, self.edge_dim)
-        # path_edge_features expanded: [N, N, max_path_len, 1, edge_s_dim]
-        path_edge_features = path_edge_features.unsqueeze(-2)
-        # dot_products: [N, N, max_path_len, num_heads]
-        dot_products = (path_edge_features * path_weights).sum(dim=-1)
-        # path_mask: [N, N, max_path_len] (True for valid edges)
-        path_mask = (shortest_path_edges != -1) 
-        dot_products = dot_products * path_mask.unsqueeze(-1) 
-        N_ij = path_mask.sum(dim=-1).clamp(min=1) 
-
-        # sum_dot_products: [N, N, num_heads]
-        sum_dot_products = dot_products.sum(dim=-2)
-        
-        # c_ij_per_head: [N, N, num_heads]
-        c_ij_per_head = sum_dot_products / N_ij.unsqueeze(-1)
-        edge_bias = c_ij_per_head.permute(2, 0, 1) # -> [num_heads, N, N]
-        return edge_bias
 
 class _VDropout(nn.Module):
     '''
@@ -525,19 +540,7 @@ class _VDropout(nn.Module):
         ).unsqueeze(-1)
         x = mask * x / (1 - self.drop_rate)
         return x
-    
-class PositionwiseFeedForward(nn.Module):
-    ''' A two-layer Feed-Forward-Network. '''
-    def __init__(self, d_in, d_hid, dropout=0.1):
-        super().__init__()
-        self.w_1 = nn.Linear(d_in, d_hid)
-        self.w_2 = nn.Linear(d_hid, d_in)
-        self.dropout = nn.Dropout(dropout)
-        self.activation = F.silu
 
-    def forward(self, x):
-        return self.w_2(self.dropout(self.activation(self.w_1(x))))
-    
 class Dropout(nn.Module):
     '''
     Combined dropout for tuples (s, V).
@@ -579,7 +582,7 @@ class LayerNorm(nn.Module):
             return self.scalar_norm(x)
         s, v = x
         vn = _norm_no_nan(v, axis=-1, keepdims=True, sqrt=False)
-        vn = torch.sqrt(torch.mean(vn, dim=-2, keepdim=True) + 1e-8)
+        vn = torch.sqrt(torch.mean(vn, dim=-2, keepdim=True))
         return self.scalar_norm(s), v / vn
 
 def tuple_sum(*args):
