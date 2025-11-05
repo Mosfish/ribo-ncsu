@@ -72,7 +72,6 @@ class AutoregressiveMultiGNNv1(torch.nn.Module):
         
         # Encoder layers (supports multiple conformations)
         self.encoder_layers = nn.ModuleList(
-                # 使用我们新的 V6 几何注意力层
                 GVPAttentionConvLayer(self.node_h_dim, self.edge_h_dim, 
                                       heads=self.heads,
                                       activations=activations, vector_gate=True,
@@ -82,7 +81,7 @@ class AutoregressiveMultiGNNv1(torch.nn.Module):
         # Decoder layers
         self.W_s = nn.Embedding(self.out_dim, self.out_dim)
         
-        # [V6] 良好实践：隔离解码器的边维度，防止 self.edge_h_dim 被污染
+        # Isolate decoder edge dimensions to prevent modifying self.edge_h_dim
         decoder_edge_h_dim = (self.edge_h_dim[0] + self.out_dim, self.edge_h_dim[1])
         
         self.decoder_layers = nn.ModuleList(

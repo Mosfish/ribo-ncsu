@@ -198,11 +198,10 @@ class GVPConv(MessagePassing):
 #########################################################################
 class GVPAttentionConvLayer(nn.Module):
     '''
-    Full GVP Attention Layer (V6 Architecture)
+    Full GVP Attention Layer
     
     Applies 'GVPAttentionConv' message passing, followed by
     residual updates and a pointwise feedforward network.
-    This is the V6 replacement for 'MultiGVPConvLayer'.
     
     :param node_dims: node embedding dimensions (n_scalar, n_vector)
     :param edge_dims: input edge embedding dimensions (n_scalar, n_vector)
@@ -228,7 +227,7 @@ class GVPAttentionConvLayer(nn.Module):
         ):
         super(GVPAttentionConvLayer, self).__init__()
         
-        # Use our new V6 'conv' core
+        # Use GVPAttentionConv as the convolution module
         self.conv = GVPAttentionConv(
             node_dims, node_dims, edge_dims,
             heads=heads, 
@@ -260,9 +259,6 @@ class GVPAttentionConvLayer(nn.Module):
         :param x: tuple (s, V) of `torch.Tensor`
         :param edge_index: array of shape [2, n_edges]
         :param edge_attr: tuple (s, V) of `torch.Tensor`
-        
-        (This forward pass is identical to MultiGVPConvLayer, just
-         swapping out the self.conv module.)
         '''
         if self.norm_first:
             dh = self.conv(self.norm[0](x), edge_index, edge_attr)
@@ -278,14 +274,10 @@ class GVPAttentionConvLayer(nn.Module):
 #########################################################################
 class GVPAttentionConv(MessagePassing):
     '''
-    GVP-Native Attention-based Message Passing (V6 Architecture)
-    
-    Combines GVP's SE(3)-equivariance with MHA, GAT, and TransformerConv
-    (edge bias) concepts in a unified layer.
-    
+    GVP-Native Attention-based Message Passing
     - Q, K, V projections are GVP-native.
-    - Attention energy is computed by a GVP-based 'head' (GAT-style).
-    - Edge features (GVP tuples) are used to bias K and V (Transformer-style).
+    - Attention energy is computed by a GVP-based 'head'.
+    - Edge features (GVP tuples) are used to bias K and V.
     '''
     def __init__(self, in_dims, out_dims, edge_dims,
                  heads=4,
@@ -309,23 +301,23 @@ class GVPAttentionConv(MessagePassing):
         GVP_ = functools.partial(GVP, 
                 activations=activations, vector_gate=vector_gate)
 
-        # 1. Q, K, V Projections (GVP-Native)
+        # Q, K, V Projections from GVP
         self.to_q = GVP_(in_dims, (self.so, self.vo))
         self.to_k = GVP_(in_dims, (self.so, self.vo))
         self.to_v = GVP_(in_dims, (self.so, self.vo))
 
-        # 2. Edge Bias Projections (TransformerConv idea)
+        # Edge Bias Projections
         self.edge_proj_k = GVP_(edge_dims, (self.so, self.vo))
         self.edge_proj_v = GVP_(edge_dims, (self.so, self.vo))
 
-        # 3. Attention Head (GAT idea)
+        # Attention Head
         # Input: concatenated Q_i and K_j_biased (per-head)
         attn_in_dims = (2 * self.head_s_dim, 2 * self.head_v_dim)
         # Output: 1 scalar (energy) per head
         self.attn_gvp = GVP(attn_in_dims, (1, 0), 
                             activations=(None, None))
 
-        # 4. Final Output Projection (Multi-head fusion)
+        # Output Projection (Multi-head fusion)
         self.out_proj = GVP_((self.so, self.vo), (self.so, self.vo))
         
 
@@ -340,12 +332,12 @@ class GVPAttentionConv(MessagePassing):
         x_s, x_v = x
         n_nodes, n_conf = x_s.shape[:2]
 
-        # 1. Project Q, K, V
+        # Project Q, K, V
         q = self.to_q(x)
         k = self.to_k(x)
         v = self.to_v(x)
 
-        # 2. Project Edge Biases
+        # Project Edge Biases
         e_k = self.edge_proj_k(edge_attr)
         e_v = self.edge_proj_v(edge_attr)
         
@@ -355,12 +347,9 @@ class GVPAttentionConv(MessagePassing):
         
         def flatten_heads(t, n, n_conf):
             s, v = t
-            # --- [V6.4] BUG 修复 ---
-            # .view() requires contiguous tensor, but GVP output (v) is transposed.
             # .reshape() is robust and handles both contiguous and non-contiguous cases.
             s_flat = s.reshape(n, n_conf * self.so)
             v_flat = v.reshape(n, n_conf * self.vo * 3)
-            # --- [V6.4] 修复结束 ---
             return torch.cat([s_flat, v_flat], dim=-1)
 
         q_flat = flatten_heads(q, n_nodes, n_conf)
@@ -371,7 +360,7 @@ class GVPAttentionConv(MessagePassing):
         e_k_flat = flatten_heads(e_k, n_edges, n_conf)
         e_v_flat = flatten_heads(e_v, n_edges, n_conf)
 
-        # 3. Propagate messages
+        # Propagate messages
         message_flat = self.propagate(
             edge_index, 
             q=q_flat, k=k_flat, v=v_flat,
@@ -379,13 +368,13 @@ class GVPAttentionConv(MessagePassing):
             n_conf=n_conf
         )
 
-        # 4. Un-flatten aggregated message
+        # Un-flatten aggregated message
         s_dim_flat = n_conf * self.so
         s_out = message_flat[..., :s_dim_flat].view(n_nodes, n_conf, self.so)
         v_out = message_flat[..., s_dim_flat:].view(n_nodes, n_conf, self.vo, 3)
         out = (s_out, v_out)
 
-        # 5. Final output projection (fusion)
+        # Final output projection (fusion)
         final_out = self.out_proj(out)
         return final_out
 
@@ -408,11 +397,11 @@ class GVPAttentionConv(MessagePassing):
         e_k = unflatten_heads(e_k, n_conf)
         e_v = unflatten_heads(e_v, n_conf)
 
-        # 1. Apply Edge Bias (in GVP space)
+        # Apply Edge Bias
         k_j_biased = tuple_sum(k_j, e_k)
         v_j_biased = tuple_sum(v_j, e_v)
 
-        # 2. Compute Attention Energy (GAT-style)
+        # Compute Attention Energy
         # attn_input: (s_cat, v_cat)
         attn_input = tuple_cat(q_i, k_j_biased)
         
@@ -420,8 +409,6 @@ class GVPAttentionConv(MessagePassing):
         # energy_s shape: [E, n_conf, H, 1]
         energy_s = self.attn_gvp(attn_input)
         energy_scalar = energy_s.squeeze(-1) # [E, n_conf, H]
-
-        # 3. Softmax
         # We need to softmax over neighbors j for each node i.
         # Reshape for softmax: [E, n_conf * H]
         energy_flat = energy_scalar.view(-1, n_conf * self.heads)
@@ -429,7 +416,7 @@ class GVPAttentionConv(MessagePassing):
         # Reshape back: [E, n_conf, H]
         alpha = alpha_flat.view(-1, n_conf, self.heads)
 
-        # 4. Apply Attention to Biased Value
+        # Apply Attention to Biased Value
         # alpha_s: [E, n_conf, H, 1]
         alpha_s = alpha.unsqueeze(-1)
         # alpha_v: [E, n_conf, H, 1, 1]
