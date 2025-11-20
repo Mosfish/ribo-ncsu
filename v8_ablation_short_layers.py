@@ -12,8 +12,8 @@ import torch_geometric
 from torch_geometric.nn import MessagePassing
 from torch_scatter import scatter_add
 from typing import Optional
-from torch_geometric.utils import softmax
 import math
+from torch_geometric.utils import softmax
 #########################################################################
 
 class GVPConvLayer(nn.Module):
@@ -402,14 +402,17 @@ class GVPAttentionConv(MessagePassing):
         k_j_biased = tuple_sum(k_j, e_k)
         v_j_biased = tuple_sum(v_j, e_v)
 
-        # Compute Attention Energy
-        # attn_input: (s_cat, v_cat)
-        attn_input = tuple_cat(q_i, k_j_biased)
+        s_q, v_q = q_i
+        s_k_biased, v_k_biased = k_j_biased
+
+        s_dot = s_q * s_k_biased
+        v_dot = (v_q * v_k_biased).sum(dim=-1) 
+
+        s_energy = s_dot.sum(dim=-1) + v_dot.sum(dim=-1) 
         
-        # self.attn_gvp maps (2*head_dims) -> (heads, 0)
-        # energy_s shape: [E, n_conf, H, 1]
-        energy_s = self.attn_gvp(attn_input)
-        energy_scalar = energy_s.squeeze(-1) # [E, n_conf, H]
+        head_dim = self.head_s_dim + self.head_v_dim
+        energy_scalar = s_energy / (math.sqrt(head_dim) if head_dim > 0 else 1.0)
+        
         # We need to softmax over neighbors j for each node i.
         # Reshape for softmax: [E, n_conf * H]
         energy_flat = energy_scalar.view(-1, n_conf * self.heads)

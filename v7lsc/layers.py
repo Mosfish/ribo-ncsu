@@ -2,6 +2,14 @@
 # Generalisation of Geometric Vector Perceptron, Jing et al.
 # for explicit multi-state biomolecule representation learning.
 # Original repository: https://github.com/drorlab/gvp-pytorch
+#
+# V7 MODIFICATION:
+# This file contains the complete V7 GeoLST architecture.
+# 1. GVPAttentionConv (V5.1 SOTA Dot-Product) - Short-Range Module
+# 2. GVPDynamicProjection (V7) - Long-Range Module
+# 3. GeoLSTLayer (V7) - Fusion Layer
+# 4. GVPConvLayer / GVPConv - gRNAde baseline (used by decoder)
+# 5. GVP base modules (GVP, LayerNorm, etc.)
 ################################################################
 
 import functools
@@ -12,30 +20,17 @@ import torch_geometric
 from torch_geometric.nn import MessagePassing
 from torch_scatter import scatter_add
 from typing import Optional
+
+# [V7-MOD] 导入 math 和 softmax
+import math 
 from torch_geometric.utils import softmax
-import math
 #########################################################################
 
 class GVPConvLayer(nn.Module):
     '''
+    (gRNAde 原版解码器层)
     Full graph convolution / message passing layer with 
-    Geometric Vector Perceptrons. Residually updates node embeddings with
-    aggregated incoming messages, applies a pointwise feedforward 
-    network to node embeddings, and returns updated node embeddings.
-    
-    To only compute the aggregated messages, see `GVPConv`.
-    
-    :param node_dims: node embedding dimensions (n_scalar, n_vector)
-    :param edge_dims: input edge embedding dimensions (n_scalar, n_vector)
-    :param n_message: number of GVPs to use in message function
-    :param n_feedforward: number of GVPs to use in feedforward function
-    :param drop_rate: drop probability in all dropout layers
-    :param autoregressive: if `True`, this `GVPConvLayer` will be used
-           with a different set of input node embeddings for messages
-           where src >= dst
-    :param activations: tuple of functions (scalar_act, vector_act) to use in GVPs
-    :param vector_gate: whether to use vector gating.
-                        (vector_act will be used as sigma^+ in vector gating if `True`)
+    Geometric Vector Perceptrons.
     '''
     def __init__(
             self, 
@@ -75,19 +70,6 @@ class GVPConvLayer(nn.Module):
 
     def forward(self, x, edge_index, edge_attr,
                 autoregressive_x=None, node_mask=None):
-        '''
-        :param x: tuple (s, V) of `torch.Tensor`
-        :param edge_index: array of shape [2, n_edges]
-        :param edge_attr: tuple (s, V) of `torch.Tensor`
-        :param autoregressive_x: tuple (s, V) of `torch.Tensor`. 
-                If not `None`, will be used as src node embeddings
-                for forming messages where src >= dst. The current node 
-                embeddings `x` will still be the base of the update and the 
-                pointwise feedforward.
-        :param node_mask: array of type `bool` to index into the first
-                dim of node embeddings (s, V). If not `None`, only
-                these nodes will be updated.
-        '''
         
         if autoregressive_x is not None:
             src, dst = edge_index
@@ -133,23 +115,8 @@ class GVPConvLayer(nn.Module):
 
 class GVPConv(MessagePassing):
     '''
+    (gRNAde 原版 GNN 卷积)
     Graph convolution / message passing with Geometric Vector Perceptrons.
-    Takes in a graph with node and edge embeddings,
-    and returns new node embeddings.
-    
-    This does NOT do residual updates and pointwise feedforward layers
-    ---see `GVPConvLayer`.
-    
-    :param in_dims: input node embedding dimensions (n_scalar, n_vector)
-    :param out_dims: output node embedding dimensions (n_scalar, n_vector)
-    :param edge_dims: input edge embedding dimensions (n_scalar, n_vector)
-    :param n_layers: number of GVPs in the message function
-    :param module_list: preconstructed message function, overrides n_layers
-    :param aggr: should be "add" if some incoming edges are masked, as in
-                 a masked autoregressive decoder architecture, otherwise "mean"
-    :param activations: tuple of functions (scalar_act, vector_act) to use in GVPs
-    :param vector_gate: whether to use vector gating.
-                        (vector_act will be used as sigma^+ in vector gating if `True`)
     '''
     def __init__(self, in_dims, out_dims, edge_dims,
                  n_layers=3, module_list=None, aggr="mean", 
@@ -179,11 +146,6 @@ class GVPConv(MessagePassing):
         self.message_func = nn.Sequential(*module_list)
 
     def forward(self, x, edge_index, edge_attr):
-        '''
-        :param x: tuple (s, V) of `torch.Tensor`
-        :param edge_index: array of shape [2, n_edges]
-        :param edge_attr: tuple (s, V) of `torch.Tensor`
-        '''
         x_s, x_v = x
         message = self.propagate(edge_index, 
                     s=x_s, v=x_v.contiguous().view(x_v.shape[0], x_v.shape[1] * 3),
@@ -196,23 +158,17 @@ class GVPConv(MessagePassing):
         message = tuple_cat((s_j, v_j), edge_attr, (s_i, v_i))
         message = self.message_func(message)
         return _merge(*message)
+        
+#########################################################################
+# [V7 短程模块 封装层] V7 Short-Range Wrapper (GVPAttentionConvLayer)
 #########################################################################
 class GVPAttentionConvLayer(nn.Module):
     '''
-    Full GVP Attention Layer
+    (V7 短程模块封装)
+    Full GVP Attention Layer (V5.1 SOTA / V7 Short-Range)
     
     Applies 'GVPAttentionConv' message passing, followed by
     residual updates and a pointwise feedforward network.
-    
-    :param node_dims: node embedding dimensions (n_scalar, n_vector)
-    :param edge_dims: input edge embedding dimensions (n_scalar, n_vector)
-    :param heads: number of attention heads
-    :param n_feedforward: number of GVPs to use in feedforward function
-    :param drop_rate: drop probability in all dropout layers
-    :param activations: tuple of functions (scalar_act, vector_act) to use in GVPs
-    :param vector_gate: whether to use vector gating.
-    :param residual: whether to use residual connections
-    :param norm_first: whether to apply layer norm before 'conv' and 'ff'
     '''
     def __init__(
             self, 
@@ -232,6 +188,7 @@ class GVPAttentionConvLayer(nn.Module):
         self.conv = GVPAttentionConv(
             node_dims, node_dims, edge_dims,
             heads=heads, 
+            drop_rate=drop_rate, # [V7-MOD] 传递 drop_rate
             activations=activations, 
             vector_gate=vector_gate
         )
@@ -241,7 +198,7 @@ class GVPAttentionConvLayer(nn.Module):
         self.norm = nn.ModuleList([LayerNorm(node_dims) for _ in range(2)])
         self.dropout = nn.ModuleList([Dropout(drop_rate) for _ in range(2)])
 
-        # Standard GVP FeedForward network (identical to MultiGVPConvLayer)
+        # Standard GVP FeedForward network
         ff_func = []
         if n_feedforward == 1:
             ff_func.append(GVP_(node_dims, node_dims))
@@ -256,11 +213,6 @@ class GVPAttentionConvLayer(nn.Module):
         self.norm_first = norm_first
 
     def forward(self, x, edge_index, edge_attr):
-        '''
-        :param x: tuple (s, V) of `torch.Tensor`
-        :param edge_index: array of shape [2, n_edges]
-        :param edge_attr: tuple (s, V) of `torch.Tensor`
-        '''
         if self.norm_first:
             dh = self.conv(self.norm[0](x), edge_index, edge_attr)
             x = tuple_sum(x, self.dropout[0](dh))
@@ -272,16 +224,21 @@ class GVPAttentionConvLayer(nn.Module):
             dh = self.ff_func(x)
             x = self.norm[1](tuple_sum(x, self.dropout[1](dh))) if self.residual else dh
         return x
+
+#########################################################################
+# [V7 短程模块 核心] V7 Short-Range Core (GVPAttentionConv)
 #########################################################################
 class GVPAttentionConv(MessagePassing):
     '''
-    GVP-Native Attention-based Message Passing
+    (V7 短程模块核心)
+    GVP-Native Attention-based Message Passing (V5.1 SOTA / V7 Short-Range)
     - Q, K, V projections are GVP-native.
-    - Attention energy is computed by a GVP-based 'head'.
+    - Attention energy is computed by a GVP-native **Dot-Product**.
     - Edge features (GVP tuples) are used to bias K and V.
     '''
     def __init__(self, in_dims, out_dims, edge_dims,
                  heads=4,
+                 drop_rate=0.1, # [V7-MOD] 接收 drop_rate
                  activations=(F.silu, torch.sigmoid), 
                  vector_gate=True):
         
@@ -311,25 +268,16 @@ class GVPAttentionConv(MessagePassing):
         self.edge_proj_k = GVP_(edge_dims, (self.so, self.vo))
         self.edge_proj_v = GVP_(edge_dims, (self.so, self.vo))
 
-        # Attention Head
-        # Input: concatenated Q_i and K_j_biased (per-head)
-        attn_in_dims = (2 * self.head_s_dim, 2 * self.head_v_dim)
-        # Output: 1 scalar (energy) per head
-        self.attn_gvp = GVP(attn_in_dims, (1, 0), 
-                            activations=(None, None))
+        # [V7-MOD] 删除 GAT-style 的 attn_gvp
+        
+        # [V7-MOD] 添加 Attention Dropout
+        self.dp_attn = nn.Dropout(drop_rate) 
 
         # Output Projection (Multi-head fusion)
         self.out_proj = GVP_((self.so, self.vo), (self.so, self.vo))
         
 
     def forward(self, x, edge_index, edge_attr):
-        '''
-        :param x: tuple (s, V) of `torch.Tensor` 
-                  s: [n_nodes, n_conf, si], V: [n_nodes, n_conf, vi, 3]
-        :param edge_index: array of shape [2, n_edges]
-        :param edge_attr: tuple (s, V) of `torch.Tensor`
-                  s: [n_edges, n_conf, se], V: [n_edges, n_conf, ve, 3]
-        '''
         x_s, x_v = x
         n_nodes, n_conf = x_s.shape[:2]
 
@@ -343,14 +291,10 @@ class GVPAttentionConv(MessagePassing):
         e_v = self.edge_proj_v(edge_attr)
         
         # --- Flatten all tuples for MessagePassing ---
-        # We follow the GVPConv pattern of flattening vectors for propagation
-        # (s, v) -> (s, v_flat) -> cat(s, v_flat)
-        
         def flatten_heads(t, n, n_conf):
             s, v = t
-            # .reshape() is robust and handles both contiguous and non-contiguous cases.
-            s_flat = s.reshape(n, n_conf * self.so)
-            v_flat = v.reshape(n, n_conf * self.vo * 3)
+            s_flat = s.contiguous().view(n, n_conf * self.so)
+            v_flat = v.contiguous().view(n, n_conf * self.vo * 3)
             return torch.cat([s_flat, v_flat], dim=-1)
 
         q_flat = flatten_heads(q, n_nodes, n_conf)
@@ -384,8 +328,6 @@ class GVPAttentionConv(MessagePassing):
                 size_i: Optional[int]) -> torch.Tensor:
 
         # --- Un-flatten all inputs ---
-        
-        # Helper to un-flatten and reshape to heads
         def unflatten_heads(t_flat, n_conf):
             s_dim_flat = n_conf * self.so
             s = t_flat[..., :s_dim_flat].view(-1, n_conf, self.heads, self.head_s_dim)
@@ -402,40 +344,278 @@ class GVPAttentionConv(MessagePassing):
         k_j_biased = tuple_sum(k_j, e_k)
         v_j_biased = tuple_sum(v_j, e_v)
 
-        # Compute Attention Energy
-        # attn_input: (s_cat, v_cat)
-        attn_input = tuple_cat(q_i, k_j_biased)
+        # --- [V7-MOD] 替换 GAT-style 为 GVP-Dot-Product ---
         
-        # self.attn_gvp maps (2*head_dims) -> (heads, 0)
-        # energy_s shape: [E, n_conf, H, 1]
-        energy_s = self.attn_gvp(attn_input)
-        energy_scalar = energy_s.squeeze(-1) # [E, n_conf, H]
-        # We need to softmax over neighbors j for each node i.
-        # Reshape for softmax: [E, n_conf * H]
+        # 2. Compute Attention Energy (Transformer-style Dot-Product)
+        s_q, v_q = q_i
+        s_k_biased, v_k_biased = k_j_biased
+
+        s_dot = s_q * s_k_biased
+        v_dot = (v_q * v_k_biased).sum(dim=-1) 
+
+        s_energy = s_dot.sum(dim=-1) + v_dot.sum(dim=-1) 
+        
+        head_dim = self.head_s_dim + self.head_v_dim
+        energy_scalar = s_energy / (math.sqrt(head_dim) if head_dim > 0 else 1.0)
+        # ----------------------------------------------------
+
+        # 3. Softmax
         energy_flat = energy_scalar.view(-1, n_conf * self.heads)
         alpha_flat = softmax(energy_flat, index, ptr=ptr, dim=0)
-        # Reshape back: [E, n_conf, H]
+        
+        # [V7-MOD] 应用 Attention Dropout (在 softmax 之后)
+        alpha_flat = self.dp_attn(alpha_flat)
+
         alpha = alpha_flat.view(-1, n_conf, self.heads)
 
-        # Apply Attention to Biased Value
-        # alpha_s: [E, n_conf, H, 1]
+        # 4. Apply Attention to Biased Value
         alpha_s = alpha.unsqueeze(-1)
-        # alpha_v: [E, n_conf, H, 1, 1]
         alpha_v = alpha.unsqueeze(-1).unsqueeze(-1)
 
         v_s_biased, v_v_biased = v_j_biased
-        msg_s = alpha_s * v_s_biased # [E, n_conf, H, s_h]
-        msg_v = alpha_v * v_v_biased # [E, n_conf, H, v_h, 3]
+        msg_s = alpha_s * v_s_biased 
+        msg_v = alpha_v * v_v_biased 
 
         # --- Flatten message for output ---
-        # msg_s: [E, n_conf * H * s_h] = [E, n_conf * so]
         msg_s_flat = msg_s.contiguous().view(msg_s.shape[0], -1)
-        # msg_v: [E, n_conf * H * v_h * 3] = [E, n_conf * vo * 3]
         msg_v_flat = msg_v.contiguous().view(msg_v.shape[0], -1)
 
         return torch.cat([msg_s_flat, msg_v_flat], dim=-1)
 
+#########################################################################
+# [V7 长程模块] V7 Long-Range Module (GVPDynamicProjection)
+#########################################################################
+class GVPDynamicProjection(nn.Module):
+    '''
+    V7 "Long-Range" 模块 (SE(3) 等变动态投影).
+    
+    实现了 "Compress" (N -> r) 和 "Broadcast" (N x r) 两个阶段。
+    这是一个独立的模块，没有 MessagePassing，因为它执行的是全局操作。
+    '''
+    def __init__(self, node_dims, heads=4, n_anchors=32, drop_rate=0.1,
+                 activations=(F.silu, torch.sigmoid), 
+                 vector_gate=True):
+        
+        super(GVPDynamicProjection, self).__init__()
+        
+        self.si, self.vi = node_dims
+        self.so, self.vo = node_dims 
+        self.n_anchors = n_anchors 
+        self.heads = heads
+        
+        assert self.so % heads == 0 and self.vo % heads == 0, \
+               "Output dimensions must be divisible by number of heads"
+        
+        self.head_s_dim = self.so // heads
+        self.head_v_dim = self.vo // heads
+        self.head_dims = (self.head_s_dim, self.head_v_dim)
+        
+        GVP_ = functools.partial(GVP, 
+                activations=activations, vector_gate=vector_gate)
+        
+        # --- 1. "Compress" (N -> r) 阶段 ---
+        self.weight_proj = GVP(node_dims, (self.n_anchors, 0),
+                               activations=(None, None))
+
+        # --- 2. "Broadcast" (N x r) 阶段 ---
+        self.to_q_long = GVP_(node_dims, (self.so, self.vo))
+        self.to_k_long = GVP_(node_dims, (self.so, self.vo))
+        self.to_v_long = GVP_(node_dims, (self.so, self.vo))
+        
+        # [V7-MOD] 长程注意力也使用 GVP-Dot-Product
+        
+        # [V7-MOD] 添加 Attention Dropout
+        self.dp_attn = nn.Dropout(drop_rate) 
+
+    def forward(self, x):
+        '''
+        :param x: tuple (s, V) of `torch.Tensor` 
+                  s: [N, n_conf, si], V: [N, n_conf, vi, 3]
+        :return: out_long: GVP tuple (s, V)
+                  s: [N, n_conf, so], V: [N, n_conf, vo, 3]
+        '''
+        s, v = x
+        n_nodes, n_conf = s.shape[:2]
+        
+        # --- 1. "Compress" (N -> r) ---
+        p_weights_s = self.weight_proj(x) 
+        p_weights = F.softmax(p_weights_s, dim=0)
+
+        s_global = torch.einsum('nca, ncs -> cas', p_weights, s)
+        v_global = torch.einsum('nca, ncvd -> cavd', p_weights, v)
+
+        s_global = s_global.transpose(0, 1) # [r, n_conf, si]
+        v_global = v_global.transpose(0, 1) # [r, n_conf, vi, 3]
+        x_global = (s_global, v_global) # 这就是 r 个锚点
+
+        # --- 2. "Broadcast" (N x r Cross-Attention) ---
+        q_long = self.to_q_long(x)        # Q 来自 N 个节点
+        k_long = self.to_k_long(x_global) # K 来自 r 个锚点
+        v_long = self.to_v_long(x_global) # V 来自 r 个锚点
+
+        # --- 重塑以分离 Heads ---
+        s_q, v_q = q_long
+        s_k, v_k = k_long
+        s_val, v_val = v_long  # 改名避免与下面的 val 变量混淆
+
+        r = self.n_anchors
+        H = self.heads
+        s_h, v_h = self.head_s_dim, self.head_v_dim
+
+        q = (s_q.contiguous().view(n_nodes, n_conf, H, s_h), v_q.contiguous().view(n_nodes, n_conf, H, v_h, 3))
+        k = (s_k.contiguous().view(r, n_conf, H, s_h), v_k.contiguous().view(r, n_conf, H, v_h, 3))
+        val = (s_val.contiguous().view(r, n_conf, H, s_h), v_val.contiguous().view(r, n_conf, H, v_h, 3))
+
+        # --- [V7-MOD] GVP-Dot-Product 计算能量 ---
+        # q_s: [N, n_conf, H, s_h], q_v: [N, n_conf, H, v_h, 3]
+        # k_s: [r, n_conf, H, s_h], k_v: [r, n_conf, H, v_h, 3]
+        
+        # einsum 计算 N x r 的点积 (s_dot)
+        # (n c h s), (r c h s) -> (n r c h)
+        s_dot = torch.einsum('nchs, rchs -> nrch', q[0], k[0])
+        
+        # einsum 计算 N x r 的点积 (v_dot)
+        # (n c h v d), (r c h v d) -> (n r c h)
+        v_dot = torch.einsum('nchvd, rchvd -> nrch', q[1], k[1])
+
+        # 聚合能量并缩放
+        s_energy = s_dot + v_dot # [N, r, n_conf, H]
+        head_dim = self.head_s_dim + self.head_v_dim
+        energy_scalar = s_energy / (math.sqrt(head_dim) if head_dim > 0 else 1.0)
+        # ----------------------------------------
+
+        # --- Softmax over r 锚点 (dim=1) ---
+        alpha = F.softmax(energy_scalar, dim=1)
+        alpha = self.dp_attn(alpha) # 应用 Dropout
+
+        # --- 加权聚合 V ---
+        alpha_s = alpha.unsqueeze(-1)
+        alpha_v = alpha.unsqueeze(-1).unsqueeze(-1)
+
+        # out_s: [N, n_conf, H, s_h]
+        out_s = (alpha_s * val[0].unsqueeze(0)).sum(dim=1)
+        # out_v: [N, n_conf, H, v_h, 3]
+        out_v = (alpha_v * val[1].unsqueeze(0)).sum(dim=1)
+
+        # --- 融合 Heads ---
+        out_s_flat = out_s.contiguous().reshape(n_nodes, n_conf, self.so)
+        out_v_flat = out_v.contiguous().reshape(n_nodes, n_conf, self.vo, 3)
+        
+        out_long = (out_s_flat, out_v_flat)
+        return out_long
+
+
+#########################################################################
+# [V7 核心融合层] V7 Core Fusion Layer (GeoLSTLayer)
+#########################################################################
+class GeoLSTLayer(nn.Module):
+    '''
+    V7 "Geo-LST" 核心层 (几何长短时 Transformer).
+    
+    融合了:
+    1. Short-Range: V5.1 SOTA GVPAttentionConv (GNN, 局部, 边偏置)
+    2. Long-Range: V7 GVPDynamicProjection (Global, 无视 edge_index)
+    
+    融合策略:
+    - DualLN (尺度归一化) + 加法融合 (稳定)
+    '''
+    def __init__(
+            self, 
+            node_dims, 
+            edge_dims,
+            heads=4, 
+            n_anchors=32,
+            n_feedforward=2, 
+            drop_rate=.1,
+            activations=(F.silu, torch.sigmoid), 
+            vector_gate=True,
+            residual=True,
+            norm_first=True,
+        ):
+        
+        super(GeoLSTLayer, self).__init__()
+        
+        # 1. 短程模块 (V5.1 SOTA 模块, 来自本文件)
+        self.short_module = GVPAttentionConv(
+            node_dims, node_dims, edge_dims,
+            heads=heads, 
+            drop_rate=drop_rate,
+            activations=activations, 
+            vector_gate=vector_gate
+        )
+        
+        # 2. 长程模块 (V7 全局模块, 来自本文件)
+        self.long_module = GVPDynamicProjection(
+            node_dims, heads=heads, n_anchors=n_anchors,
+            drop_rate=drop_rate,
+            activations=activations,
+            vector_gate=vector_gate
+        )
+        
+        # 3. 融合模块 (LST DualLN)
+        self.ln_short = LayerNorm(node_dims)
+        self.ln_long = LayerNorm(node_dims)
+        
+        # 4. 标准 FFN 和残差连接
+        GVP_ = functools.partial(GVP,
+                activations=activations, vector_gate=vector_gate)
+
+        # [V7-MOD] 修复 Bug：Pre-LN 结构只需要 1 个 Norm (用于 FFN)
+        self.norm = LayerNorm(node_dims)
+        self.dropout = nn.ModuleList([Dropout(drop_rate) for _ in range(2)])
+
+        ff_func = []
+        if n_feedforward == 1:
+            ff_func.append(GVP_(node_dims, node_dims))
+        else:
+            hid_dims = 4*node_dims[0], 2*node_dims[1]
+            ff_func.append(GVP_(node_dims, hid_dims))
+            for i in range(n_feedforward-2):
+                ff_func.append(GVP_(hid_dims, hid_dims))
+            ff_func.append(GVP_(hid_dims, node_dims, activations=(None, None)))
+        self.ff_func = nn.Sequential(*ff_func)
+        
+        self.residual = residual
+        self.norm_first = norm_first # 确保坚持 Pre-LN 结构
+
+    def forward(self, x, edge_index, edge_attr):
+        '''
+        :param x: tuple (s, V) of `torch.Tensor`
+        :param edge_index: array of shape [2, n_edges]
+        :param edge_attr: tuple (s, V) of `torch.Tensor`
+        '''
+        x_in = x  # 保存原始输入用于残差连接
+
+        # --- 1. DualLN (LST 论文核心) ---
+        # 直接从 x_in 开始，避免过度归一化
+        x_short_in = self.ln_short(x_in)
+        x_long_in = self.ln_long(x_in)
+
+        # --- 2. 平行计算 (Short & Long) ---
+        # 短程：SOTA GVP-Attention (V5.1)
+        out_short = self.short_module(x_short_in, edge_index, edge_attr)
+
+        # 长程：SE(3) Dynamic Projection (V7)
+        out_long = self.long_module(x_long_in)
+
+        # --- 3. 融合：加法聚合 (LST 论文图 1) ---
+        x_fused = tuple_sum(out_short, out_long)
+
+        # --- 4. 第一个残差连接 (Pre-LN) ---
+        x_res_1 = tuple_sum(x_in, self.dropout[0](x_fused))
+
+        # --- 5. FFN Block (Pre-LN) ---
+        x_norm_2 = self.norm(x_res_1)  # 使用单个 Norm
+        x_ff = self.ff_func(x_norm_2)
+
+        # --- 6. 第二个残差连接 ---
+        x_out = tuple_sum(x_res_1, self.dropout[1](x_ff))
+
+        return x_out
+        
 ########################################################################
+#########################################################################
+# GVP 基础模块 (保持不变)
 #########################################################################
 
 class GVP(nn.Module):
@@ -581,16 +761,24 @@ def tuple_sum(*args):
 
 def tuple_cat(*args, dim=-1):
     '''
+    [V7.1 BUG 1 修复]
     Concatenates any number of tuples (s, V) elementwise.
     
-    :param dim: dimension along which to concatenate when viewed
+    :param dim: dimension along which to concatenate when reshaped
                 as the `dim` index for the scalar-channel tensors.
                 This means that `dim=-1` will be applied as
                 `dim=-2` for the vector-channel tensors.
     '''
     dim %= len(args[0][0].shape)
     s_args, v_args = list(zip(*args))
-    return torch.cat(s_args, dim=dim), torch.cat(v_args, dim=dim)
+    
+    # [V7.1 BUG 1 修复] 
+    # 实现文档字符串的逻辑
+    v_dim = dim
+    if dim == -1 or dim == len(args[0][0].shape) - 1:
+        v_dim = -2 # 当 s_cat 在最后一个维度, v_cat 在倒数第二个维度
+    
+    return torch.cat(s_args, dim=dim), torch.cat(v_args, dim=v_dim)
 
 def tuple_index(x, idx):
     '''
